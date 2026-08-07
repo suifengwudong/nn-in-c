@@ -1,0 +1,585 @@
+// stb 风格神经网络库实现
+
+#ifndef NN_H_
+#define NN_H_
+
+#include <stddef.h>
+#include <stdio.h>
+
+#define nn_real float
+
+#ifndef NN_MALLOC
+#include <stdlib.h>
+#define NN_MALLOC malloc
+#endif
+
+#ifndef NN_ASSERT
+#include <assert.h>
+#define NN_ASSERT assert
+#endif
+
+#define _USE_MATH_DEFINES
+#include <math.h>
+
+// ==================== Activation System ====================
+
+static inline nn_real sigmoidf(nn_real x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static inline nn_real reluf(nn_real x) {
+    return x > 0.0f ? x : 0.0f;
+}
+
+static inline nn_real geluf(nn_real x) {
+    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (x + 0.044715f * powf(x, 3.0f))));
+}
+
+static inline nn_real sigmoid_gradf(nn_real x) {
+    nn_real s = sigmoidf(x);
+    return s * (1.0f - s);
+}
+
+static inline nn_real relu_gradf(nn_real x) {
+    return x > 0.0f ? 1.0f : 0.0f;
+}
+
+static inline nn_real gelu_gradf(nn_real x) {
+    nn_real c = sqrtf(2.0f / M_PI) * (x + 0.044715f * powf(x, 3.0f));
+    nn_real t = tanhf(c);
+    return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * sqrtf(2.0f / M_PI) * (1.0f + 0.134145f * x * x);
+}
+
+#define ACTIVATIONS \
+    X(ACT_SIGMOID, sigmoidf,   sigmoid_gradf) \
+    X(ACT_RELU,    reluf,      relu_gradf)    \
+    X(ACT_GELU,    geluf,      gelu_gradf)
+
+#define X(id, fn, grad_fn) id,
+typedef enum { ACTIVATIONS } ActivationType;
+#undef X
+
+static inline nn_real activate(ActivationType type, nn_real x) {
+    switch (type) {
+        #define X(id, fn, grad_fn) case id: return fn(x);
+        ACTIVATIONS
+        #undef X
+    }
+    return x;
+}
+
+static inline nn_real activate_grad(ActivationType type, nn_real x) {
+    switch (type) {
+        #define X(id, fn, grad_fn) case id: return grad_fn(x);
+        ACTIVATIONS
+        #undef X
+    }
+    return 0.0f;
+}
+
+// ==================== Matrix ====================
+
+typedef struct {
+    size_t rows;
+    size_t cols;
+    size_t row_stride;   // 相邻两行首元素之间的元素间隔
+    size_t col_stride;   // 相邻两列元素之间的元素间隔
+    nn_real *elements;
+} Matrix;
+
+#define mat_at(m, r, c) ((m).elements[(r) * (m).row_stride + (c) * (m).col_stride])
+
+Matrix mat_alloc(size_t rows, size_t cols);
+void mat_free(Matrix m);
+Matrix mat_from_array(size_t rows, size_t cols, const nn_real* array);
+void mat_fill(Matrix m, nn_real value);
+void mat_rand(Matrix m, nn_real min, nn_real max);
+Matrix mat_submatrix(Matrix m, size_t row_start, size_t row_end, size_t col_start, size_t col_end);
+Matrix mat_row(Matrix m, size_t row);
+Matrix mat_transpose(Matrix m);
+void mat_copy(Matrix dest, const Matrix src);
+// result = a dot b
+void mat_mul(Matrix result, const Matrix a, const Matrix b);
+// result += a
+void mat_add(Matrix result, const Matrix a);
+// result += s·a (result -= y when s = -1)
+void mat_add_scaled(Matrix result, const Matrix a, nn_real s);
+// dest = s·a
+void mat_scale(Matrix dest, const Matrix a, nn_real s);
+// result += a · b (用于 dW += δ·aᵀ 这种批量累积)
+void mat_mul_acc(Matrix result, const Matrix a, const Matrix b);
+void _mat_print(const Matrix m, const char* name);
+#define mat_print(m) _mat_print(m, #m)
+
+// ==================== Layer ====================
+
+typedef struct {
+    size_t input_size;
+    size_t output_size;
+    Matrix weights;
+    Matrix biases;
+    Matrix activations;
+    ActivationType act;
+} Layer;
+
+Layer layer_alloc(size_t output_size, size_t input_size);
+void layer_free(Layer layer);
+void layer_forward(Layer* layer, const Matrix input);
+void layer_activate(Layer* layer);
+void layer_pass(Layer* layer, const Matrix input);
+
+// ==================== Neural Network ====================
+
+typedef struct {
+    size_t num_layers;
+    Matrix *weights;
+    Matrix *biases;
+    Matrix *activations;        // post-activation: a[l] = σ(z[l])
+    Matrix *weighted_sum;    // pre-activation:  z[l] = W[l-1]·a[l-1] + b[l-1]
+    ActivationType *acts;
+    int has_scratch;
+} NN;
+
+NN nn_alloc(size_t num_layers, const size_t* layer_sizes, const ActivationType* acts);
+NN nn_alloc_grad(size_t num_layers, const size_t* layer_sizes);
+void nn_free(NN nn);
+void nn_forward(NN nn);
+void nn_rand(NN nn, nn_real min, nn_real max);
+void nn_zero(NN nn);
+void nn_copy(NN dest, NN src);
+nn_real nn_cost(NN nn, Matrix train_in, Matrix train_out);
+void nn_finite_diff(NN nn, NN grad, Matrix train_in, Matrix train_out, nn_real eps);
+void nn_backprop_scl(NN nn, NN grad, Matrix train_in, Matrix train_out);
+void nn_backprop_mat(NN nn, NN grad, Matrix train_in, Matrix train_out);
+void nn_learn(NN nn, NN grad, nn_real learning_rate);
+
+// Matrix version is control by USE_SCALAR_BACKPROP macro
+#if defined(USE_SCALAR_BACKPROP)
+#define nn_backprop nn_backprop_scl
+#else
+#define nn_backprop nn_backprop_mat
+#endif
+
+// ==================== Implementation ====================
+
+#ifdef NN_IMPLEMENTATION
+
+Matrix mat_alloc(size_t rows, size_t cols) {
+    Matrix m;
+    m.rows = rows;
+    m.cols = cols;
+    m.row_stride = cols;
+    m.col_stride = 1;
+    m.elements = (nn_real*)NN_MALLOC(sizeof(*m.elements) * rows * cols);
+    NN_ASSERT(m.elements != NULL);
+    return m;
+}
+
+Matrix mat_from_array(size_t rows, size_t cols, const nn_real* array) {
+    Matrix m = mat_alloc(rows, cols);
+    for (size_t i = 0; i < rows; i++)
+        for (size_t j = 0; j < cols; j++)
+            mat_at(m, i, j) = array[i * cols + j];
+    return m;
+}
+
+void mat_free(Matrix m) {
+    free(m.elements);
+}
+
+void mat_fill(Matrix m, nn_real value) {
+    for (size_t i = 0; i < m.rows; i++)
+        for (size_t j = 0; j < m.cols; j++)
+            mat_at(m, i, j) = value;
+}
+
+void mat_rand(Matrix m, nn_real min, nn_real max) {
+    NN_ASSERT(min < max);
+    for (size_t i = 0; i < m.rows; i++)
+        for (size_t j = 0; j < m.cols; j++)
+            mat_at(m, i, j) = min + (max - min) * ((nn_real)rand() / RAND_MAX);
+}
+
+Matrix mat_submatrix(Matrix m, size_t row_start, size_t row_end, size_t col_start, size_t col_end) {
+    NN_ASSERT(row_start < row_end && row_end <= m.rows);
+    NN_ASSERT(col_start < col_end && col_end <= m.cols);
+    Matrix sub;
+    sub.rows = row_end - row_start;
+    sub.cols = col_end - col_start;
+    sub.row_stride = m.row_stride;
+    sub.col_stride = m.col_stride;
+    sub.elements = &mat_at(m, row_start, col_start);
+    return sub;
+}
+
+Matrix mat_row(Matrix m, size_t row) {
+    NN_ASSERT(row < m.rows);
+    return (Matrix){
+        .rows = 1,
+        .cols = m.cols,
+        .row_stride = m.row_stride,
+        .col_stride = m.col_stride,
+        .elements = &mat_at(m, row, 0),
+    };
+}
+
+Matrix mat_transpose(Matrix m) {
+    return (Matrix){
+        .rows = m.cols,
+        .cols = m.rows,
+        .row_stride = m.col_stride,
+        .col_stride = m.row_stride,
+        .elements = m.elements,
+    };
+}
+
+void mat_copy(Matrix dest, const Matrix src) {
+    NN_ASSERT(dest.rows == src.rows && dest.cols == src.cols);
+    for (size_t i = 0; i < src.rows; i++)
+        for (size_t j = 0; j < src.cols; j++)
+            mat_at(dest, i, j) = mat_at(src, i, j);
+}
+
+void mat_mul(Matrix result, const Matrix a, const Matrix b) {
+    NN_ASSERT(a.cols == b.rows);
+    NN_ASSERT(result.rows == a.rows && result.cols == b.cols);
+    for (size_t i = 0; i < a.rows; i++) {
+        for (size_t j = 0; j < b.cols; j++) {
+            mat_at(result, i, j) = 0.0;
+            for (size_t k = 0; k < a.cols; k++)
+                mat_at(result, i, j) += mat_at(a, i, k) * mat_at(b, k, j);
+        }
+    }
+}
+
+void mat_add(Matrix result, const Matrix a) {
+    NN_ASSERT(result.rows == a.rows && result.cols == a.cols);
+    for (size_t i = 0; i < a.rows; i++)
+        for (size_t j = 0; j < a.cols; j++)
+            mat_at(result, i, j) += mat_at(a, i, j);
+}
+
+void mat_add_scaled(Matrix result, const Matrix a, nn_real s) {
+    NN_ASSERT(result.rows == a.rows && result.cols == a.cols);
+    for (size_t i = 0; i < a.rows; i++)
+        for (size_t j = 0; j < a.cols; j++)
+            mat_at(result, i, j) += s * mat_at(a, i, j);
+}
+
+void mat_scale(Matrix dest, const Matrix a, nn_real s) {
+    NN_ASSERT(dest.rows == a.rows && dest.cols == a.cols);
+    for (size_t i = 0; i < a.rows; i++)
+        for (size_t j = 0; j < a.cols; j++)
+            mat_at(dest, i, j) = s * mat_at(a, i, j);
+}
+
+void mat_mul_acc(Matrix result, const Matrix a, const Matrix b) {
+    NN_ASSERT(a.cols == b.rows);
+    NN_ASSERT(result.rows == a.rows && result.cols == b.cols);
+    for (size_t i = 0; i < a.rows; i++) {
+        for (size_t j = 0; j < b.cols; j++) {
+            nn_real sum = 0.0;
+            for (size_t k = 0; k < a.cols; k++)
+                sum += mat_at(a, i, k) * mat_at(b, k, j);
+            mat_at(result, i, j) += sum;
+        }
+    }
+}
+
+void _mat_print(const Matrix m, const char* name) {
+    printf("%s = [\n", name);
+    for (size_t i = 0; i < m.rows; i++) {
+        for (size_t j = 0; j < m.cols; j++)
+            printf("%f\t", mat_at(m, i, j));
+        printf("\n");
+    }
+    printf("]\n");
+}
+
+Layer layer_alloc(size_t output_size, size_t input_size) {
+    Layer layer;
+    layer.input_size = input_size;
+    layer.output_size = output_size;
+    layer.act = ACT_RELU;
+    layer.weights = mat_alloc(output_size, input_size);
+    layer.biases = mat_alloc(1, output_size);
+    layer.activations = mat_alloc(1, output_size);
+    return layer;
+}
+
+void layer_free(Layer layer) {
+    mat_free(layer.weights);
+    mat_free(layer.biases);
+    mat_free(layer.activations);
+}
+
+void layer_forward(Layer* layer, const Matrix input) {
+    NN_ASSERT(input.rows == 1 && input.cols == layer->input_size);
+    for (size_t j = 0; j < layer->output_size; j++) {
+        nn_real sum = mat_at(layer->biases, 0, j);
+        for (size_t k = 0; k < layer->input_size; k++)
+            sum += mat_at(input, 0, k) * mat_at(layer->weights, j, k);
+        mat_at(layer->activations, 0, j) = sum;
+    }
+}
+
+void layer_activate(Layer* layer) {
+    for (size_t i = 0; i < layer->output_size; i++)
+        mat_at(layer->activations, 0, i) = activate(layer->act, mat_at(layer->activations, 0, i));
+}
+
+void layer_pass(Layer* layer, const Matrix input) {
+    layer_forward(layer, input);
+    layer_activate(layer);
+}
+
+// {1, 2, 1} = {input_layer, hidden_layers, output_layer}
+NN nn_alloc(size_t num_layers, const size_t* layer_sizes, const ActivationType* acts) {
+    NN nn;
+    nn.num_layers = num_layers;
+    nn.has_scratch = 1;
+    nn.weights = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
+    nn.biases = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
+    nn.activations = (Matrix*)NN_MALLOC(sizeof(Matrix) * num_layers);
+    nn.weighted_sum = (Matrix*)NN_MALLOC(sizeof(Matrix) * num_layers);
+    nn.acts = (ActivationType*)NN_MALLOC(sizeof(ActivationType) * (num_layers - 1));
+
+    for (size_t i = 0; i < num_layers - 1; i++) {
+        nn.weights[i] = mat_alloc(layer_sizes[i + 1], layer_sizes[i]);
+        nn.biases[i] = mat_alloc(1, layer_sizes[i + 1]);
+        nn.acts[i] = acts[i];
+    }
+
+    for (size_t i = 0; i < num_layers; i++) {
+        nn.activations[i] = mat_alloc(1, layer_sizes[i]);
+        nn.weighted_sum[i] = mat_alloc(1, layer_sizes[i]);
+    }
+
+    return nn;
+}
+
+NN nn_alloc_grad(size_t num_layers, const size_t* layer_sizes) {
+    NN nn;
+    nn.num_layers = num_layers;
+    nn.has_scratch = 0;
+    nn.weights = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
+    nn.biases = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
+    nn.activations = NULL;
+    nn.weighted_sum = NULL;
+    nn.acts = NULL;
+
+    for (size_t i = 0; i < num_layers - 1; i++) {
+        nn.weights[i] = mat_alloc(layer_sizes[i + 1], layer_sizes[i]);
+        nn.biases[i] = mat_alloc(1, layer_sizes[i + 1]);
+    }
+
+    return nn;
+}
+
+void nn_free(NN nn) {
+    if (nn.has_scratch) {
+        for (size_t i = 0; i < nn.num_layers; i++) {
+            mat_free(nn.activations[i]);
+            mat_free(nn.weighted_sum[i]);
+        }
+        free(nn.activations);
+        free(nn.weighted_sum);
+        free(nn.acts);
+    }
+    for (size_t i = 0; i < nn.num_layers - 1; i++) {
+        mat_free(nn.weights[i]);
+        mat_free(nn.biases[i]);
+    }
+    free(nn.weights);
+    free(nn.biases);
+}
+
+void nn_forward(NN nn) {
+    for (size_t l = 0; l < nn.num_layers - 1; l++) {
+        for (size_t j = 0; j < nn.weights[l].rows; j++) {
+            nn_real sum = mat_at(nn.biases[l], 0, j);
+            for (size_t k = 0; k < nn.weights[l].cols; k++)
+                sum += mat_at(nn.activations[l], 0, k) * mat_at(nn.weights[l], j, k);
+            mat_at(nn.weighted_sum[l + 1], 0, j) = sum;
+            mat_at(nn.activations[l + 1], 0, j) = activate(nn.acts[l], sum);
+        }
+    }
+}
+
+void nn_rand(NN nn, nn_real min, nn_real max) {
+    for (size_t i = 0; i < nn.num_layers - 1; i++) {
+        mat_rand(nn.weights[i], min, max);
+        mat_rand(nn.biases[i], min, max);
+    }
+}
+
+void nn_zero(NN nn) {
+    for (size_t i = 0; i < nn.num_layers - 1; i++) {
+        mat_fill(nn.weights[i], 0.0);
+        mat_fill(nn.biases[i], 0.0);
+    }
+}
+
+void nn_copy(NN dest, NN src) {
+    NN_ASSERT(dest.num_layers == src.num_layers);
+    for (size_t i = 0; i < dest.num_layers - 1; i++) {
+        mat_copy(dest.weights[i], src.weights[i]);
+        mat_copy(dest.biases[i], src.biases[i]);
+    }
+    if (dest.has_scratch && src.has_scratch)
+        for (size_t i = 0; i < dest.num_layers - 1; i++) {
+            dest.acts[i] = src.acts[i];
+            mat_copy(dest.activations[i+1], src.activations[i+1]);
+            mat_copy(dest.weighted_sum[i+1], src.weighted_sum[i+1]);
+        }
+}
+
+nn_real nn_cost(NN nn, Matrix train_in, Matrix train_out) {
+    NN_ASSERT(train_in.rows == train_out.rows);
+    nn_real sum = 0.0;
+    size_t L = nn.num_layers - 1;
+    for (size_t n = 0; n < train_in.rows; n++) {
+        mat_copy(nn.activations[0], mat_row(train_in, n));
+        nn_forward(nn);
+        Matrix output_row = mat_row(train_out, n);
+        for (size_t j = 0; j < train_out.cols; j++) {
+            nn_real diff = mat_at(nn.activations[L], 0, j) - mat_at(output_row, 0, j);
+            sum += diff * diff;
+        }
+    }
+    return sum / train_in.rows;
+}
+
+void nn_finite_diff(NN nn, NN grad, Matrix train_in, Matrix train_out, nn_real eps) {
+    nn_real original_cost = nn_cost(nn, train_in, train_out);
+    nn_real saved;
+
+    for (size_t l = 0; l < nn.num_layers - 1; l++) {
+        for (size_t i = 0; i < nn.weights[l].rows; i++) {
+            for (size_t j = 0; j < nn.weights[l].cols; j++) {
+                saved = mat_at(nn.weights[l], i, j);
+                mat_at(nn.weights[l], i, j) += eps;
+                mat_at(grad.weights[l], i, j) = (nn_cost(nn, train_in, train_out) - original_cost) / eps;
+                mat_at(nn.weights[l], i, j) = saved;
+            }
+        }
+        for (size_t j = 0; j < nn.biases[l].cols; j++) {
+            saved = mat_at(nn.biases[l], 0, j);
+            mat_at(nn.biases[l], 0, j) += eps;
+            mat_at(grad.biases[l], 0, j) = (nn_cost(nn, train_in, train_out) - original_cost) / eps;
+            mat_at(nn.biases[l], 0, j) = saved;
+        }
+    }
+}
+
+/**
+ * @brief 反向传播算法 (逐样本版本，纯练习)
+ * @param nn 神经网络
+ * @param grad 梯度
+ * @param train_in 训练输入
+ * @param train_out 训练输出
+ */
+void nn_backprop_scl(NN nn, NN grad, Matrix train_in, Matrix train_out) {
+    NN_ASSERT(nn.has_scratch);
+    NN_ASSERT(train_in.rows == train_out.rows);
+    nn_zero(grad);
+
+    size_t L = nn.num_layers - 1;
+    nn_real factor = 2.0f / train_in.rows;
+
+    for (size_t n = 0; n < train_in.rows; n++) {
+        mat_copy(nn.activations[0], mat_row(train_in, n));
+        nn_forward(nn);
+
+        // δ[L] = (2/N)(a[L] - y) ⊙ σ'(z[L])
+        for (size_t j = 0; j < nn.activations[L].cols; j++) {
+            nn_real diff = mat_at(nn.activations[L], 0, j) - mat_at(train_out, n, j);
+            nn_real sg = activate_grad(nn.acts[L-1], mat_at(nn.weighted_sum[L], 0, j));
+            mat_at(nn.activations[L], 0, j) = factor * diff * sg;
+        }
+
+        // 反向传播: l = L ... 1
+        for (size_t l = L; l > 0; l--) {
+            size_t w = l - 1;
+
+            // dW[w][j][k] += δ[l][j] × a[l-1][k]
+            for (size_t j = 0; j < nn.weights[w].rows; j++)
+                for (size_t k = 0; k < nn.weights[w].cols; k++)
+                    mat_at(grad.weights[w], j, k) += mat_at(nn.activations[l], 0, j) * mat_at(nn.activations[l-1], 0, k);
+
+            // db[w][j] += δ[l][j]
+            for (size_t j = 0; j < nn.biases[w].cols; j++)
+                mat_at(grad.biases[w], 0, j) += mat_at(nn.activations[l], 0, j);
+
+            // δ[l-1] = δ[l] · W[w] ⊙ σ'(z[l-1])
+            if (l > 1) {
+                for (size_t k = 0; k < nn.weights[w].cols; k++) {
+                    nn_real sum = 0.0;
+                    for (size_t j = 0; j < nn.weights[w].rows; j++)
+                        sum += mat_at(nn.activations[l], 0, j) * mat_at(nn.weights[w], j, k);
+                    mat_at(nn.activations[l-1], 0, k) = sum * activate_grad(nn.acts[l-2], mat_at(nn.weighted_sum[l-1], 0, k));
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief 反向传播算法 (矩阵版本)
+ * @param nn 神经网络
+ * @param grad 梯度
+ * @param train_in 训练输入
+ * @param train_out 训练输出
+ */
+void nn_backprop_mat(NN nn, NN grad, Matrix train_in, Matrix train_out) {
+    NN_ASSERT(nn.has_scratch);
+    NN_ASSERT(train_in.rows == train_out.rows);
+    nn_zero(grad);
+
+    size_t L = nn.num_layers - 1;
+    nn_real factor = 2.0f / train_in.rows;
+
+    for (size_t n = 0; n < train_in.rows; n++) {
+        mat_copy(nn.activations[0], mat_row(train_in, n));
+        nn_forward(nn);
+
+        // δ[L] = (2/N)(a[L] - y) ⊙ σ'(z[L]), => activations[L]
+        mat_add_scaled(nn.activations[L], mat_row(train_out, n), -1.0f);   // a[L] -= y
+        mat_scale(nn.activations[L], nn.activations[L], factor);           // a[L] *= 2/N
+        for (size_t j = 0; j < nn.activations[L].cols; j++)
+            mat_at(nn.activations[L], 0, j) *= activate_grad(nn.acts[L-1], mat_at(nn.weighted_sum[L], 0, j));
+
+        // 反向传播:l = L ... 1
+        for (size_t l = L; l > 0; l--) {
+            size_t w = l - 1;
+
+            // dW[w] += δ[l]^T · a[l-1] (外积,δ[l]^T 为列向量视图); db[w] += δ[l]
+            mat_mul_acc(grad.weights[w], mat_transpose(nn.activations[l]), nn.activations[l-1]);
+            mat_add(grad.biases[w], nn.activations[l]);
+
+            // δ[l-1] = (W[w]^T · δ[l]) ⊙ σ'(z[l-1]);
+            // 1×in 行向量的转置视图是 in×1, mat_mul 直接写入该视图即得列 δ[l-1]^T
+            if (l > 1) {
+                mat_mul(mat_transpose(nn.activations[l-1]),
+                        mat_transpose(nn.weights[w]),
+                        mat_transpose(nn.activations[l]));
+                for (size_t k = 0; k < nn.activations[l-1].cols; k++)
+                    mat_at(nn.activations[l-1], 0, k) *= activate_grad(nn.acts[l-2], mat_at(nn.weighted_sum[l-1], 0, k));
+            }
+        }
+    }
+}
+
+void nn_learn(NN nn, NN grad, nn_real learning_rate) {
+    for (size_t l = 0; l < nn.num_layers - 1; l++) {
+        for (size_t i = 0; i < nn.weights[l].rows; i++)
+            for (size_t j = 0; j < nn.weights[l].cols; j++)
+                mat_at(nn.weights[l], i, j) -= learning_rate * mat_at(grad.weights[l], i, j);
+        for (size_t j = 0; j < nn.biases[l].cols; j++)
+            mat_at(nn.biases[l], 0, j) -= learning_rate * mat_at(grad.biases[l], 0, j);
+    }
+}
+
+#endif // NN_IMPLEMENTATION
+
+#endif // NN_H_
