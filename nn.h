@@ -41,6 +41,7 @@ static inline nn_real geluf(nn_real x) {
 }
 
 static inline nn_real identity_gradf(nn_real x) {
+    (void)x;
     return 1.0f;
 }
 
@@ -108,16 +109,20 @@ Matrix mat_submatrix(Matrix m, size_t row_start, size_t row_end, size_t col_star
 Matrix mat_row(Matrix m, size_t row);
 Matrix mat_transpose(Matrix m);
 void mat_copy(Matrix dest, const Matrix src);
-// result = a dot b
-void mat_mul(Matrix result, const Matrix a, const Matrix b);
-// result += a
-void mat_add(Matrix result, const Matrix a);
-// result += s·a (result -= y when s = -1)
-void mat_add_scaled(Matrix result, const Matrix a, nn_real s);
-// dest = s·a
-void mat_scale(Matrix dest, const Matrix a, nn_real s);
-// result += a · b (用于 dW += δ·aᵀ 这种批量累积)
-void mat_mul_acc(Matrix result, const Matrix a, const Matrix b);
+
+// ==================== BLAS  ====================
+// dst = beta·dst + alpha·(a·b)
+void mat_gemm(Matrix dst, const Matrix a, const Matrix b, nn_real alpha, nn_real beta);
+// dst = beta·dst + alpha·a
+void mat_axpy(Matrix dst, const Matrix a, nn_real alpha, nn_real beta);
+
+// alias
+#define mat_mul(dst, a, b)        mat_gemm(dst, a, b, 1.0f, 0.0f)
+#define mat_mul_acc(dst, a, b, s) mat_gemm(dst, a, b, s, 1.0f)
+#define mat_add(dst, a)           mat_axpy(dst, a, 1.0f, 1.0f)
+#define mat_add_scaled(dst, a, s) mat_axpy(dst, a, s, 1.0f)
+#define mat_scale(dst, a, s)      mat_axpy(dst, a, s, 0.0f)
+
 void _mat_print(const Matrix m, const char* name);
 #define mat_print(m) _mat_print(m, #m)
 
@@ -128,117 +133,65 @@ typedef struct {
     size_t output_size;
     Matrix weights;
     Matrix biases;
-    Matrix activations;
+    Matrix weighted_sum;  // z = W·x + b
+    Matrix activations;   // a = sigma(z)
     ActivationType act;
+
+    Matrix grad_weights;
+    Matrix grad_biases;
 } Layer;
 
-Layer layer_alloc(size_t output_size, size_t input_size);
+Layer layer_alloc(size_t output_size, size_t input_size, ActivationType act);
 void layer_free(Layer layer);
 void layer_forward(Layer* layer, const Matrix input);
 void layer_activate(Layer* layer);
 void layer_pass(Layer* layer, const Matrix input);
+void layer_backward(Layer* layer, Matrix input, const Matrix delta);
+
+// ==================== LossLayer ====================
+// 损失层: 无权重, 只计算 loss 值与对输入的梯度 (通常是 logits)
+// api: forward & backward; distributed by LossType
+
+#define LOSS_LAYERS \
+    X(LOSS_MSE,           mse_layer_forward,  mse_layer_backward) \
+    X(LOSS_CROSS_ENTROPY, ce_layer_forward,   ce_layer_backward)
+
+#define X(id, fwd, bwd) id,
+typedef enum { LOSS_LAYERS } LossType;
+#undef X
+
+typedef struct {
+    LossType type;
+    Matrix probs;
+} LossLayer;
+
+nn_real mse_layer_forward(LossLayer* layer, const Matrix in, const Matrix y);
+void mse_layer_backward(LossLayer* layer, Matrix delta, const Matrix in, const Matrix y);
+nn_real ce_layer_forward(LossLayer* layer, const Matrix in, const Matrix y);
+void ce_layer_backward(LossLayer* layer, Matrix delta, const Matrix in, const Matrix y);
+
+nn_real loss_forward(LossLayer* layer, const Matrix in, const Matrix y);
+void loss_backward(LossLayer* layer, Matrix delta, const Matrix in, const Matrix y);
 
 // ==================== Neural Network ====================
 
 typedef struct {
     size_t num_layers;
-    Matrix *weights;
-    Matrix *biases;
-    Matrix *activations;        // post-activation: a[l] = σ(z[l])
-    Matrix *weighted_sum;    // pre-activation:  z[l] = W[l-1]·a[l-1] + b[l-1]
-    ActivationType *acts;
-    // LossType loss;
-    int has_scratch;
+    Matrix input;        // 1×arch[0]: 输入行缓冲, 前向/反向使用
+    Layer *layers;
+    LossLayer loss;      // 单个损失层
 } NN;
 
-NN nn_alloc(size_t num_layers, const size_t* layer_sizes, const ActivationType* acts);
-NN nn_alloc_grad(size_t num_layers, const size_t* layer_sizes);
+NN nn_alloc(size_t num_layers, const size_t* layer_sizes, const ActivationType* acts, LossType loss);
 void nn_free(NN nn);
 void nn_forward(NN nn);
 void nn_rand(NN nn, nn_real min, nn_real max);
 void nn_zero(NN nn);
 void nn_copy(NN dest, NN src);
 nn_real nn_cost(NN nn, Matrix train_in, Matrix train_out);
-void nn_finite_diff(NN nn, NN grad, Matrix train_in, Matrix train_out, nn_real eps);
-void nn_backprop_scl(NN nn, NN grad, Matrix train_in, Matrix train_out);
-void nn_backprop_mat(NN nn, NN grad, Matrix train_in, Matrix train_out);
-void nn_learn(NN nn, NN grad, nn_real learning_rate);
-
-// Matrix version is control by USE_SCALAR_BACKPROP macro
-#if defined(USE_SCALAR_BACKPROP)
-#define nn_backprop nn_backprop_scl
-#else
-#define nn_backprop nn_backprop_mat
-#endif
-
-
-// ==================== Loss functions ====================
-
-// static inline nn_real msef(const Matrix pred, const Matrix true_val) {
-//     // 实际上，pred 和 true_val 都是 1xN 的矩阵, 但为了通用性, 这里允许任意形状的矩阵
-//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
-//     nn_real sum = 0.0f;
-//     for (size_t i = 0; i < pred.rows; i++) {
-//         for (size_t j = 0; j < pred.cols; j++) {
-//             nn_real diff = mat_at(pred, i, j) - mat_at(true_val, i, j);
-//             sum += diff * diff;
-//         }
-//     }
-//     return sum / (pred.rows * pred.cols);
-// }
-
-// static inline nn_real msef_grad(const Matrix pred, const Matrix true_val, Matrix grad) {
-//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
-//     NN_ASSERT(grad.rows == pred.rows && grad.cols == pred.cols);
-//     for (size_t i = 0; i < pred.rows; i++) {
-//         for (size_t j = 0; j < pred.cols; j++) {
-//             mat_at(grad, i, j) = 2.0f * (mat_at(pred, i, j) - mat_at(true_val, i, j)) / (pred.rows * pred.cols);
-//         }
-//     }
-// }
-
-// static inline nn_real cef(const Matrix pred, const Matrix true_val) {
-//     // 实际上，pred 和 true_val 都是 1xN 的矩阵, 但为了通用性, 这里允许任意形状的矩阵
-//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
-//     nn_real sum = 0.0f;
-//     for (size_t i = 0; i < pred.rows; i++) {
-//         for (size_t j = 0; j < pred.cols; j++) {
-//             nn_real p = mat_at(pred, i, j);
-//             nn_real t = mat_at(true_val, i, j);
-//             sum += t * logf(p + NN_EPSILON);  // 加一个小的常数避免 log(0)
-//         }
-//     }
-//     return -sum / (pred.rows * pred.cols);
-// }
-
-// static inline nn_real cef_grad(const Matrix pred, const Matrix true_val, Matrix grad) {
-//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
-//     NN_ASSERT(grad.rows == pred.rows && grad.cols == pred.cols);
-//     for (size_t i = 0; i < pred.rows; i++) {
-//         for (size_t j = 0; j < pred.cols; j++) {
-//             nn_real p = mat_at(pred, i, j);
-//             nn_real t = mat_at(true_val, i, j);
-//             mat_at(grad, i, j) = -t / (p + NN_EPSILON) / (pred.rows * pred.cols);  // 加一个小的常数避免除以 0
-//         }
-//     }
-// }
-
-// #define LOSS \
-//     X(LOSS_MSE, msef,   msef_grad) \
-//     X(LOSS_CE,  cef,    cef_grad)
-
-// #define X(id, fn, grad_fn) id,
-// typedef enum { LOSS } LossType;
-// #undef X
-
-// static inline nn_real activate(LossType type, nn_real x) {
-//     switch (type) {
-//         #define X(id, fn, grad_fn) case id: return fn(x);
-//         LOSS
-//         #undef X
-//     }
-//     return x;
-// }
+void nn_finite_diff(NN nn, Matrix train_in, Matrix train_out, nn_real eps);
+void nn_backprop(NN nn, Matrix train_in, Matrix train_out);
+void nn_learn(NN nn, nn_real learning_rate);
 
 
 // ==================== Implementation ====================
@@ -321,50 +274,26 @@ void mat_copy(Matrix dest, const Matrix src) {
             mat_at(dest, i, j) = mat_at(src, i, j);
 }
 
-void mat_mul(Matrix result, const Matrix a, const Matrix b) {
+// dst = beta·dst + alpha·(a·b)
+void mat_gemm(Matrix dst, const Matrix a, const Matrix b, nn_real alpha, nn_real beta) {
     NN_ASSERT(a.cols == b.rows);
-    NN_ASSERT(result.rows == a.rows && result.cols == b.cols);
+    NN_ASSERT(dst.rows == a.rows && dst.cols == b.cols);
     for (size_t i = 0; i < a.rows; i++) {
         for (size_t j = 0; j < b.cols; j++) {
-            mat_at(result, i, j) = 0.0;
+            nn_real acc = 0.0;
             for (size_t k = 0; k < a.cols; k++)
-                mat_at(result, i, j) += mat_at(a, i, k) * mat_at(b, k, j);
+                acc += mat_at(a, i, k) * mat_at(b, k, j);
+            mat_at(dst, i, j) = beta * mat_at(dst, i, j) + alpha * acc;
         }
     }
 }
 
-void mat_add(Matrix result, const Matrix a) {
-    NN_ASSERT(result.rows == a.rows && result.cols == a.cols);
+// dst = beta·dst + alpha·a
+void mat_axpy(Matrix dst, const Matrix a, nn_real alpha, nn_real beta) {
+    NN_ASSERT(dst.rows == a.rows && dst.cols == a.cols);
     for (size_t i = 0; i < a.rows; i++)
         for (size_t j = 0; j < a.cols; j++)
-            mat_at(result, i, j) += mat_at(a, i, j);
-}
-
-void mat_add_scaled(Matrix result, const Matrix a, nn_real s) {
-    NN_ASSERT(result.rows == a.rows && result.cols == a.cols);
-    for (size_t i = 0; i < a.rows; i++)
-        for (size_t j = 0; j < a.cols; j++)
-            mat_at(result, i, j) += s * mat_at(a, i, j);
-}
-
-void mat_scale(Matrix dest, const Matrix a, nn_real s) {
-    NN_ASSERT(dest.rows == a.rows && dest.cols == a.cols);
-    for (size_t i = 0; i < a.rows; i++)
-        for (size_t j = 0; j < a.cols; j++)
-            mat_at(dest, i, j) = s * mat_at(a, i, j);
-}
-
-void mat_mul_acc(Matrix result, const Matrix a, const Matrix b) {
-    NN_ASSERT(a.cols == b.rows);
-    NN_ASSERT(result.rows == a.rows && result.cols == b.cols);
-    for (size_t i = 0; i < a.rows; i++) {
-        for (size_t j = 0; j < b.cols; j++) {
-            nn_real sum = 0.0;
-            for (size_t k = 0; k < a.cols; k++)
-                sum += mat_at(a, i, k) * mat_at(b, k, j);
-            mat_at(result, i, j) += sum;
-        }
-    }
+            mat_at(dst, i, j) = beta * mat_at(dst, i, j) + alpha * mat_at(a, i, j);
 }
 
 void _mat_print(const Matrix m, const char* name) {
@@ -377,29 +306,37 @@ void _mat_print(const Matrix m, const char* name) {
     printf("]\n");
 }
 
-Layer layer_alloc(size_t output_size, size_t input_size) {
+Layer layer_alloc(size_t output_size, size_t input_size, ActivationType act) {
     Layer layer;
     layer.input_size = input_size;
     layer.output_size = output_size;
-    layer.act = ACT_RELU;
+    layer.act = act;
     layer.weights = mat_alloc(output_size, input_size);
     layer.biases = mat_alloc(1, output_size);
+    layer.weighted_sum = mat_alloc(1, output_size);
     layer.activations = mat_alloc(1, output_size);
+    layer.grad_weights = mat_alloc(output_size, input_size);
+    layer.grad_biases = mat_alloc(1, output_size);
     return layer;
 }
 
 void layer_free(Layer layer) {
     mat_free(layer.weights);
     mat_free(layer.biases);
+    mat_free(layer.weighted_sum);
     mat_free(layer.activations);
+    mat_free(layer.grad_weights);
+    mat_free(layer.grad_biases);
 }
 
+// z = W·x + b;  a = act(z), 同时记录 z 供反向使用
 void layer_forward(Layer* layer, const Matrix input) {
     NN_ASSERT(input.rows == 1 && input.cols == layer->input_size);
     for (size_t j = 0; j < layer->output_size; j++) {
         nn_real sum = mat_at(layer->biases, 0, j);
         for (size_t k = 0; k < layer->input_size; k++)
             sum += mat_at(input, 0, k) * mat_at(layer->weights, j, k);
+        mat_at(layer->weighted_sum, 0, j) = sum;
         mat_at(layer->activations, 0, j) = sum;
     }
 }
@@ -414,250 +351,259 @@ void layer_pass(Layer* layer, const Matrix input) {
     layer_activate(layer);
 }
 
-// {1, 2, 1} = {input_layer, hidden_layers, output_layer}
-NN nn_alloc(size_t num_layers, const size_t* layer_sizes, const ActivationType* acts) {
-    NN nn;
-    nn.num_layers = num_layers;
-    nn.has_scratch = 1;
-    nn.weights = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
-    nn.biases = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
-    nn.activations = (Matrix*)NN_MALLOC(sizeof(Matrix) * num_layers);
-    nn.weighted_sum = (Matrix*)NN_MALLOC(sizeof(Matrix) * num_layers);
-    nn.acts = (ActivationType*)NN_MALLOC(sizeof(ActivationType) * (num_layers - 1));
-
-    for (size_t i = 0; i < num_layers - 1; i++) {
-        nn.weights[i] = mat_alloc(layer_sizes[i + 1], layer_sizes[i]);
-        nn.biases[i] = mat_alloc(1, layer_sizes[i + 1]);
-        nn.acts[i] = acts[i];
+void layer_backward(Layer* layer, Matrix input, const Matrix delta) {
+    // 1. δz_j = delta_j · act'(z_j), 暂存到 activations
+    for (size_t j = 0; j < layer->output_size; j++) {
+        mat_at(layer->activations, 0, j) = mat_at(delta, 0, j)
+            * activate_grad(layer->act, mat_at(layer->weighted_sum, 0, j));
     }
 
-    for (size_t i = 0; i < num_layers; i++) {
-        nn.activations[i] = mat_alloc(1, layer_sizes[i]);
-        nn.weighted_sum[i] = mat_alloc(1, layer_sizes[i]);
-    }
+    // 2. grad_weights += δz^T · input; grad_biases += δz
+    mat_mul_acc(layer->grad_weights, mat_transpose(layer->activations), input, 1.0f);
+    mat_add(layer->grad_biases, layer->activations);
 
-    return nn;
+    // 3. 回传: input = δz · W (1×C 乘 C×K → 1×K), 就地覆盖, 不再需要 delta 字段
+    mat_mul(input, layer->activations, layer->weights);
 }
 
-NN nn_alloc_grad(size_t num_layers, const size_t* layer_sizes) {
+// ==================== LossLayer impl ====================
+// 每个 LossLayer 提供两个接口: forward(算批次平均损失) / backward(给对 logits 的梯度)
+// forward 可能归一化 (CE 写入 layer->probs), backward 复用该概率
+
+// --- MSE 层: 输入即输出, 无需归一化 ---
+//   ℓ = 1/n Σ_n Σ_j (a_j - y_j)²
+nn_real mse_layer_forward(LossLayer* layer, const Matrix in, const Matrix y) {
+    (void)layer;  // MSE 不归一化, 不需要 layer
+    NN_ASSERT(in.rows == y.rows && in.cols == y.cols);
+    nn_real sum = 0.0f;
+    for (size_t i = 0; i < in.rows; i++) {
+        Matrix a = mat_row(in, i);
+        Matrix t = mat_row(y, i);
+        for (size_t j = 0; j < in.cols; j++) {
+            nn_real d = mat_at(a, 0, j) - mat_at(t, 0, j);
+            sum += d * d;
+        }
+    }
+    return sum / (nn_real)in.rows;
+}
+
+//  δ = 2(a - y)  (a 即 logits, 输出层 act=ACT_IDENTITY)
+void mse_layer_backward(LossLayer* layer, Matrix delta, const Matrix in, const Matrix y) {
+    (void)layer;
+    NN_ASSERT(delta.rows == 1 && in.rows == 1 && y.rows == 1 && delta.cols == in.cols && in.cols == y.cols);
+    for (size_t j = 0; j < in.cols; j++)
+        mat_at(delta, 0, j) = 2.0f * (mat_at(in, 0, j) - mat_at(y, 0, j));
+}
+
+// --- CE 层: 先把 logits 逐行 softmax 归一化到 layer->probs, 再算交叉熵 ---
+//   p = softmax(z);  ℓ = -1/n Σ_n Σ_j y_j·log(p_j)
+nn_real ce_layer_forward(LossLayer* layer, const Matrix in, const Matrix y) {
+    NN_ASSERT(in.rows == y.rows && in.cols == y.cols);
+    // 确保 probs 与输入同形状
+    if (layer->probs.rows != in.rows || layer->probs.cols != in.cols) {
+        mat_free(layer->probs);
+        layer->probs = mat_alloc(in.rows, in.cols);
+    }
+    // 逐行 softmax (减行最大值防溢出)
+    for (size_t i = 0; i < in.rows; i++) {
+        nn_real max = mat_at(in, i, 0);
+        for (size_t j = 1; j < in.cols; j++)
+            if (mat_at(in, i, j) > max) max = mat_at(in, i, j);
+        nn_real expsum = 0.0f;
+        for (size_t j = 0; j < in.cols; j++) {
+            nn_real e = expf(mat_at(in, i, j) - max);
+            mat_at(layer->probs, i, j) = e;
+            expsum += e;
+        }
+        for (size_t j = 0; j < in.cols; j++)
+            mat_at(layer->probs, i, j) /= expsum;
+    }
+    nn_real sum = 0.0f;
+    for (size_t i = 0; i < in.rows; i++) {
+        Matrix p = mat_row(layer->probs, i);
+        Matrix t = mat_row(y, i);
+        for (size_t j = 0; j < in.cols; j++)
+            sum += mat_at(t, 0, j) * logf(mat_at(p, 0, j) + NN_EPSILON);  // 防 log(0)
+    }
+    return -sum / (nn_real)in.rows;
+}
+
+//  δ = (p - y)  (softmax+CE 配对后对 logits 的梯度, σ' 抵消; p 来自 forward 的 probs)
+void ce_layer_backward(LossLayer* layer, Matrix delta, const Matrix in, const Matrix y) {
+    (void)in;  // 梯度直接用 forward 保存的 probs, 不需要 logits
+    NN_ASSERT(delta.rows == 1 && y.rows == 1 && delta.cols == y.cols);
+    NN_ASSERT(layer->probs.rows == 1 && layer->probs.cols == y.cols);
+    Matrix p = mat_row(layer->probs, 0);
+    Matrix t = mat_row(y, 0);
+    for (size_t j = 0; j < y.cols; j++)
+        mat_at(delta, 0, j) = mat_at(p, 0, j) - mat_at(t, 0, j);
+}
+
+// --- 统一分发器 (由 LOSS_LAYERS X-macro 生成) ---
+
+nn_real loss_forward(LossLayer* layer, const Matrix in, const Matrix y) {
+    switch (layer->type) {
+        #define X(id, fwd, bwd) case id: return fwd(layer, in, y);
+        LOSS_LAYERS
+        #undef X
+    }
+    return 0.0f;
+}
+
+void loss_backward(LossLayer* layer, Matrix delta, const Matrix in, const Matrix y) {
+    switch (layer->type) {
+        #define X(id, fwd, bwd) case id: bwd(layer, delta, in, y); break;
+        LOSS_LAYERS
+        #undef X
+    }
+}
+
+// ==================== NN impl ====================
+
+// {1, 2, 1} = {input_layer, hidden_layers, output_layer}
+NN nn_alloc(size_t num_layers, const size_t* layer_sizes, const ActivationType* acts, LossType loss) {
     NN nn;
     nn.num_layers = num_layers;
-    nn.has_scratch = 0;
-    nn.weights = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
-    nn.biases = (Matrix*)NN_MALLOC(sizeof(Matrix) * (num_layers - 1));
-    nn.activations = NULL;
-    nn.weighted_sum = NULL;
-    nn.acts = NULL;
+    nn.input = mat_alloc(1, layer_sizes[0]);
+    nn.layers = (Layer*)NN_MALLOC(sizeof(Layer) * num_layers);
+    NN_ASSERT(nn.layers != NULL);
 
-    for (size_t i = 0; i < num_layers - 1; i++) {
-        nn.weights[i] = mat_alloc(layer_sizes[i + 1], layer_sizes[i]);
-        nn.biases[i] = mat_alloc(1, layer_sizes[i + 1]);
+    for (size_t i = 0; i < num_layers; i++) {
+        nn.layers[i] = layer_alloc(layer_sizes[i + 1], layer_sizes[i], acts[i]);
     }
 
+    nn.loss.type = loss;
+    nn.loss.probs = mat_alloc(1, layer_sizes[num_layers]);
     return nn;
 }
 
 void nn_free(NN nn) {
-    if (nn.has_scratch) {
-        for (size_t i = 0; i < nn.num_layers; i++) {
-            mat_free(nn.activations[i]);
-            mat_free(nn.weighted_sum[i]);
-        }
-        free(nn.activations);
-        free(nn.weighted_sum);
-        free(nn.acts);
-    }
-    for (size_t i = 0; i < nn.num_layers - 1; i++) {
-        mat_free(nn.weights[i]);
-        mat_free(nn.biases[i]);
-    }
-    free(nn.weights);
-    free(nn.biases);
+    mat_free(nn.input);
+    for (size_t i = 0; i < nn.num_layers; i++)
+        layer_free(nn.layers[i]);
+    free(nn.layers);
+    mat_free(nn.loss.probs);
 }
 
+// 前向: 输入在 nn.input, 逐层 layer_pass (仿射→激活)
 void nn_forward(NN nn) {
-    for (size_t l = 0; l < nn.num_layers - 1; l++) {
-        for (size_t j = 0; j < nn.weights[l].rows; j++) {
-            nn_real sum = mat_at(nn.biases[l], 0, j);
-            for (size_t k = 0; k < nn.weights[l].cols; k++)
-                sum += mat_at(nn.activations[l], 0, k) * mat_at(nn.weights[l], j, k);
-            mat_at(nn.weighted_sum[l + 1], 0, j) = sum;
-            mat_at(nn.activations[l + 1], 0, j) = activate(nn.acts[l], sum);
-        }
+    Matrix in = nn.input;
+    for (size_t i = 0; i < nn.num_layers; i++) {
+        layer_pass(&nn.layers[i], in);
+        in = nn.layers[i].activations;
     }
 }
 
 void nn_rand(NN nn, nn_real min, nn_real max) {
-    for (size_t i = 0; i < nn.num_layers - 1; i++) {
-        mat_rand(nn.weights[i], min, max);
-        mat_rand(nn.biases[i], min, max);
+    for (size_t i = 0; i < nn.num_layers; i++) {
+        mat_rand(nn.layers[i].weights, min, max);
+        mat_rand(nn.layers[i].biases, min, max);
     }
 }
 
 void nn_zero(NN nn) {
-    for (size_t i = 0; i < nn.num_layers - 1; i++) {
-        mat_fill(nn.weights[i], 0.0);
-        mat_fill(nn.biases[i], 0.0);
+    for (size_t i = 0; i < nn.num_layers; i++) {
+        mat_fill(nn.layers[i].grad_weights, 0.0);
+        mat_fill(nn.layers[i].grad_biases, 0.0);
     }
 }
 
 void nn_copy(NN dest, NN src) {
     NN_ASSERT(dest.num_layers == src.num_layers);
-    for (size_t i = 0; i < dest.num_layers - 1; i++) {
-        mat_copy(dest.weights[i], src.weights[i]);
-        mat_copy(dest.biases[i], src.biases[i]);
+    dest.loss.type = src.loss.type;
+    mat_copy(dest.input, src.input);
+    for (size_t i = 0; i < dest.num_layers; i++) {
+        mat_copy(dest.layers[i].weights, src.layers[i].weights);
+        mat_copy(dest.layers[i].biases, src.layers[i].biases);
+        dest.layers[i].act = src.layers[i].act;
+        mat_copy(dest.layers[i].grad_weights, src.layers[i].grad_weights);
+        mat_copy(dest.layers[i].grad_biases, src.layers[i].grad_biases);
     }
-    if (dest.has_scratch && src.has_scratch)
-        for (size_t i = 0; i < dest.num_layers - 1; i++) {
-            dest.acts[i] = src.acts[i];
-            mat_copy(dest.activations[i+1], src.activations[i+1]);
-            mat_copy(dest.weighted_sum[i+1], src.weighted_sum[i+1]);
-        }
+    mat_copy(dest.loss.probs, src.loss.probs);
 }
 
 nn_real nn_cost(NN nn, Matrix train_in, Matrix train_out) {
     NN_ASSERT(train_in.rows == train_out.rows);
     nn_real sum = 0.0;
-    size_t L = nn.num_layers - 1;
+    Matrix out = nn.layers[nn.num_layers - 1].activations;
     for (size_t n = 0; n < train_in.rows; n++) {
-        mat_copy(nn.activations[0], mat_row(train_in, n));
+        mat_copy(nn.input, mat_row(train_in, n));
         nn_forward(nn);
-        Matrix output_row = mat_row(train_out, n);
-        for (size_t j = 0; j < train_out.cols; j++) {
-            nn_real diff = mat_at(nn.activations[L], 0, j) - mat_at(output_row, 0, j);
-            sum += diff * diff;
-        }
+        sum += loss_forward(&nn.loss, out, mat_row(train_out, n));
     }
     return sum / train_in.rows;
 }
 
-void nn_finite_diff(NN nn, NN grad, Matrix train_in, Matrix train_out, nn_real eps) {
+// 有限差分: 梯度写入 nn 各层的 grad_weights/grad_biases
+void nn_finite_diff(NN nn, Matrix train_in, Matrix train_out, nn_real eps) {
     nn_real original_cost = nn_cost(nn, train_in, train_out);
     nn_real saved;
 
-    for (size_t l = 0; l < nn.num_layers - 1; l++) {
-        for (size_t i = 0; i < nn.weights[l].rows; i++) {
-            for (size_t j = 0; j < nn.weights[l].cols; j++) {
-                saved = mat_at(nn.weights[l], i, j);
-                mat_at(nn.weights[l], i, j) += eps;
-                mat_at(grad.weights[l], i, j) = (nn_cost(nn, train_in, train_out) - original_cost) / eps;
-                mat_at(nn.weights[l], i, j) = saved;
+    for (size_t l = 0; l < nn.num_layers; l++) {
+        for (size_t i = 0; i < nn.layers[l].weights.rows; i++) {
+            for (size_t j = 0; j < nn.layers[l].weights.cols; j++) {
+                saved = mat_at(nn.layers[l].weights, i, j);
+                mat_at(nn.layers[l].weights, i, j) += eps;
+                mat_at(nn.layers[l].grad_weights, i, j) = (nn_cost(nn, train_in, train_out) - original_cost) / eps;
+                mat_at(nn.layers[l].weights, i, j) = saved;
             }
         }
-        for (size_t j = 0; j < nn.biases[l].cols; j++) {
-            saved = mat_at(nn.biases[l], 0, j);
-            mat_at(nn.biases[l], 0, j) += eps;
-            mat_at(grad.biases[l], 0, j) = (nn_cost(nn, train_in, train_out) - original_cost) / eps;
-            mat_at(nn.biases[l], 0, j) = saved;
+        for (size_t j = 0; j < nn.layers[l].biases.cols; j++) {
+            saved = mat_at(nn.layers[l].biases, 0, j);
+            mat_at(nn.layers[l].biases, 0, j) += eps;
+            mat_at(nn.layers[l].grad_biases, 0, j) = (nn_cost(nn, train_in, train_out) - original_cost) / eps;
+            mat_at(nn.layers[l].biases, 0, j) = saved;
         }
     }
 }
 
 /**
- * @brief 反向传播算法 (逐样本版本，纯练习)
+ * @brief 反向传播
  * @param nn 神经网络
- * @param grad 梯度
  * @param train_in 训练输入
  * @param train_out 训练输出
  */
-void nn_backprop_scl(NN nn, NN grad, Matrix train_in, Matrix train_out) {
-    NN_ASSERT(nn.has_scratch);
+void nn_backprop(NN nn, Matrix train_in, Matrix train_out) {
     NN_ASSERT(train_in.rows == train_out.rows);
-    nn_zero(grad);
+    nn_zero(nn);
 
     size_t L = nn.num_layers - 1;
-    nn_real factor = 2.0f / train_in.rows;
+    Matrix out = nn.layers[L].activations;
 
     for (size_t n = 0; n < train_in.rows; n++) {
-        mat_copy(nn.activations[0], mat_row(train_in, n));
+        mat_copy(nn.input, mat_row(train_in, n));
         nn_forward(nn);
 
-        // δ[L] = (2/N)(a[L] - y) ⊙ σ'(z[L])
-        for (size_t j = 0; j < nn.activations[L].cols; j++) {
-            nn_real diff = mat_at(nn.activations[L], 0, j) - mat_at(train_out, n, j);
-            nn_real sg = activate_grad(nn.acts[L-1], mat_at(nn.weighted_sum[L], 0, j));
-            mat_at(nn.activations[L], 0, j) = factor * diff * sg;
+        // 输出层: loss_forward 算损失 (CE 内部归一化到 probs), loss_backward 给对 logits 的梯度
+        loss_forward(&nn.loss, out, mat_row(train_out, n));
+        loss_backward(&nn.loss, out, out, mat_row(train_out, n));
+
+        // 反向: l = L ... 0; 每层就地累积梯度, 回传梯度写入 input (即上一层的输出缓冲)
+        Matrix delta = out;
+        for (size_t l = L; l < nn.num_layers; l--) {
+            Matrix in = (l == 0) ? nn.input : nn.layers[l - 1].activations;
+            layer_backward(&nn.layers[l], in, delta);
+            delta = in;
+            if (l == 0) break;
         }
+    }
 
-        // 反向传播: l = L ... 1
-        for (size_t l = L; l > 0; l--) {
-            size_t w = l - 1;
-
-            // dW[w][j][k] += δ[l][j] × a[l-1][k]
-            for (size_t j = 0; j < nn.weights[w].rows; j++)
-                for (size_t k = 0; k < nn.weights[w].cols; k++)
-                    mat_at(grad.weights[w], j, k) += mat_at(nn.activations[l], 0, j) * mat_at(nn.activations[l-1], 0, k);
-
-            // db[w][j] += δ[l][j]
-            for (size_t j = 0; j < nn.biases[w].cols; j++)
-                mat_at(grad.biases[w], 0, j) += mat_at(nn.activations[l], 0, j);
-
-            // δ[l-1] = δ[l] · W[w] ⊙ σ'(z[l-1])
-            if (l > 1) {
-                for (size_t k = 0; k < nn.weights[w].cols; k++) {
-                    nn_real sum = 0.0;
-                    for (size_t j = 0; j < nn.weights[w].rows; j++)
-                        sum += mat_at(nn.activations[l], 0, j) * mat_at(nn.weights[w], j, k);
-                    mat_at(nn.activations[l-1], 0, k) = sum * activate_grad(nn.acts[l-2], mat_at(nn.weighted_sum[l-1], 0, k));
-                }
-            }
-        }
+    // 平均: grad /= n
+    nn_real inv = 1.0f / (nn_real)train_in.rows;
+    for (size_t l = 0; l < nn.num_layers; l++) {
+        mat_scale(nn.layers[l].grad_weights, nn.layers[l].grad_weights, inv);
+        mat_scale(nn.layers[l].grad_biases, nn.layers[l].grad_biases, inv);
     }
 }
 
-/**
- * @brief 反向传播算法 (矩阵版本)
- * @param nn 神经网络
- * @param grad 梯度
- * @param train_in 训练输入
- * @param train_out 训练输出
- */
-void nn_backprop_mat(NN nn, NN grad, Matrix train_in, Matrix train_out) {
-    NN_ASSERT(nn.has_scratch);
-    NN_ASSERT(train_in.rows == train_out.rows);
-    nn_zero(grad);
-
-    size_t L = nn.num_layers - 1;
-    nn_real factor = 2.0f / train_in.rows;
-
-    for (size_t n = 0; n < train_in.rows; n++) {
-        mat_copy(nn.activations[0], mat_row(train_in, n));
-        nn_forward(nn);
-
-        // δ[L] = (2/N)(a[L] - y) ⊙ σ'(z[L]), => activations[L]
-        mat_add_scaled(nn.activations[L], mat_row(train_out, n), -1.0f);   // a[L] -= y
-        mat_scale(nn.activations[L], nn.activations[L], factor);           // a[L] *= 2/N
-        for (size_t j = 0; j < nn.activations[L].cols; j++)
-            mat_at(nn.activations[L], 0, j) *= activate_grad(nn.acts[L-1], mat_at(nn.weighted_sum[L], 0, j));
-
-        // 反向传播:l = L ... 1
-        for (size_t l = L; l > 0; l--) {
-            size_t w = l - 1;
-
-            // dW[w] += δ[l]^T · a[l-1] (外积,δ[l]^T 为列向量视图); db[w] += δ[l]
-            mat_mul_acc(grad.weights[w], mat_transpose(nn.activations[l]), nn.activations[l-1]);
-            mat_add(grad.biases[w], nn.activations[l]);
-
-            // δ[l-1] = (W[w]^T · δ[l]) ⊙ σ'(z[l-1]);
-            // 1×in 行向量的转置视图是 in×1, mat_mul 直接写入该视图即得列 δ[l-1]^T
-            if (l > 1) {
-                mat_mul(mat_transpose(nn.activations[l-1]),
-                        mat_transpose(nn.weights[w]),
-                        mat_transpose(nn.activations[l]));
-                for (size_t k = 0; k < nn.activations[l-1].cols; k++)
-                    mat_at(nn.activations[l-1], 0, k) *= activate_grad(nn.acts[l-2], mat_at(nn.weighted_sum[l-1], 0, k));
-            }
-        }
-    }
-}
-
-void nn_learn(NN nn, NN grad, nn_real learning_rate) {
-    for (size_t l = 0; l < nn.num_layers - 1; l++) {
-        for (size_t i = 0; i < nn.weights[l].rows; i++)
-            for (size_t j = 0; j < nn.weights[l].cols; j++)
-                mat_at(nn.weights[l], i, j) -= learning_rate * mat_at(grad.weights[l], i, j);
-        for (size_t j = 0; j < nn.biases[l].cols; j++)
-            mat_at(nn.biases[l], 0, j) -= learning_rate * mat_at(grad.biases[l], 0, j);
+// 用各层就地梯度更新参数
+void nn_learn(NN nn, nn_real learning_rate) {
+    for (size_t l = 0; l < nn.num_layers; l++) {
+        for (size_t i = 0; i < nn.layers[l].weights.rows; i++)
+            for (size_t j = 0; j < nn.layers[l].weights.cols; j++)
+                mat_at(nn.layers[l].weights, i, j) -= learning_rate * mat_at(nn.layers[l].grad_weights, i, j);
+        for (size_t j = 0; j < nn.layers[l].biases.cols; j++)
+            mat_at(nn.layers[l].biases, 0, j) -= learning_rate * mat_at(nn.layers[l].grad_biases, 0, j);
     }
 }
 

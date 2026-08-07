@@ -28,9 +28,9 @@ static size_t argmax_row(const Matrix m, size_t row) {
 // 在整个数据集上计算分类准确率
 static double accuracy(NN nn, const MNIST_Data* data) {
     size_t correct = 0;
-    Matrix out = nn.layers[nn.num_layers - 1].activations;
+    Matrix out = nn.activations[nn.num_layers - 1];
     for (size_t n = 0; n < data->count; n++) {
-        mat_copy(nn.input, mat_row(data->images, n));
+        mat_copy(nn.activations[0], mat_row(data->images, n));
         nn_forward(nn);
         if (argmax_row(out, 0) == argmax_row(data->labels, n))
             correct++;
@@ -54,10 +54,11 @@ int main(int argc, char** argv) {
 
     printf("训练集: %zu 张, 测试集: %zu 张\n", train.count, test.count);
 
-    // 网络结构: 784 -> 128 -> 64 -> 10, 输出层 identity (logits), 损失用交叉熵
+    // 网络结构: 784 -> 128 -> 64 -> 10
     size_t arch[] = {MNIST_IMAGE_PIXELS, 128, 64, MNIST_NUM_CLASSES};
-    ActivationType acts[] = {ACT_GELU, ACT_GELU, ACT_IDENTITY};
-    NN nn = nn_alloc(LEN(arch) - 1, arch, acts, LOSS_CROSS_ENTROPY);
+    ActivationType acts[] = {ACT_GELU, ACT_GELU, ACT_SIGMOID};
+    NN nn = nn_alloc(LEN(arch), arch, acts);
+    NN grad = nn_alloc_grad(LEN(arch), arch);
     nn_rand(nn, -0.1f, 0.1f);
 
     // 洗牌索引 + 小批量缓冲区
@@ -92,8 +93,8 @@ int main(int argc, char** argv) {
                 mat_copy(mat_row(in, i), mat_row(train.images, perm[start + i]));
                 mat_copy(mat_row(out, i), mat_row(train.labels, perm[start + i]));
             }
-            nn_backprop(nn, in, out);
-            nn_learn(nn, lr);
+            nn_backprop(nn, grad, in, out);
+            nn_learn(nn, grad, lr);
         }
 
         nn_real loss = nn_cost(nn, train.images, train.labels);
@@ -111,6 +112,7 @@ int main(int argc, char** argv) {
     mat_free(batch_in);
     mat_free(batch_out);
     nn_free(nn);
+    nn_free(grad);
     mnist_free(train);
     mnist_free(test);
     return 0;
