@@ -47,9 +47,9 @@ static inline nn_real geluf(nn_real x) {
 }
 
 #define ACTIVATIONS \
-    X(ACbold(t)_SIGMOID, sigmoidf) \
-    X(ACbold(t)_RELU,    reluf)    \
-    X(ACbold(t)_GELU,    geluf)
+    X(ACT_SIGMOID, sigmoidf) \
+    X(ACT_RELU,    reluf)    \
+    X(ACT_GELU,    geluf)
 
 #define X(id, name) id,
 typedef enum { ACTIVATIONS } ActivationType;
