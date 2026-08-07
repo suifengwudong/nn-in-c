@@ -1,5 +1,5 @@
 #define NN_IMPLEMENTATION
-#include "nn.h"
+#include "../nn.h"
 #include <time.h>
 
 #define LEN(xs) (sizeof(xs) / sizeof((xs)[0]))

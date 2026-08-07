@@ -20,8 +20,13 @@
 
 #define _USE_MATH_DEFINES
 #include <math.h>
+#define NN_EPSILON 1e-8f
 
 // ==================== Activation System ====================
+
+static inline nn_real identityf(nn_real x) {
+    return x;
+}
 
 static inline nn_real sigmoidf(nn_real x) {
     return 1.0f / (1.0f + expf(-x));
@@ -33,6 +38,10 @@ static inline nn_real reluf(nn_real x) {
 
 static inline nn_real geluf(nn_real x) {
     return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (x + 0.044715f * powf(x, 3.0f))));
+}
+
+static inline nn_real identity_gradf(nn_real x) {
+    return 1.0f;
 }
 
 static inline nn_real sigmoid_gradf(nn_real x) {
@@ -51,6 +60,7 @@ static inline nn_real gelu_gradf(nn_real x) {
 }
 
 #define ACTIVATIONS \
+    X(ACT_IDENTITY, identityf, identity_gradf) \
     X(ACT_SIGMOID, sigmoidf,   sigmoid_gradf) \
     X(ACT_RELU,    reluf,      relu_gradf)    \
     X(ACT_GELU,    geluf,      gelu_gradf)
@@ -137,6 +147,7 @@ typedef struct {
     Matrix *activations;        // post-activation: a[l] = σ(z[l])
     Matrix *weighted_sum;    // pre-activation:  z[l] = W[l-1]·a[l-1] + b[l-1]
     ActivationType *acts;
+    // LossType loss;
     int has_scratch;
 } NN;
 
@@ -159,6 +170,76 @@ void nn_learn(NN nn, NN grad, nn_real learning_rate);
 #else
 #define nn_backprop nn_backprop_mat
 #endif
+
+
+// ==================== Loss functions ====================
+
+// static inline nn_real msef(const Matrix pred, const Matrix true_val) {
+//     // 实际上，pred 和 true_val 都是 1xN 的矩阵, 但为了通用性, 这里允许任意形状的矩阵
+//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
+//     nn_real sum = 0.0f;
+//     for (size_t i = 0; i < pred.rows; i++) {
+//         for (size_t j = 0; j < pred.cols; j++) {
+//             nn_real diff = mat_at(pred, i, j) - mat_at(true_val, i, j);
+//             sum += diff * diff;
+//         }
+//     }
+//     return sum / (pred.rows * pred.cols);
+// }
+
+// static inline nn_real msef_grad(const Matrix pred, const Matrix true_val, Matrix grad) {
+//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
+//     NN_ASSERT(grad.rows == pred.rows && grad.cols == pred.cols);
+//     for (size_t i = 0; i < pred.rows; i++) {
+//         for (size_t j = 0; j < pred.cols; j++) {
+//             mat_at(grad, i, j) = 2.0f * (mat_at(pred, i, j) - mat_at(true_val, i, j)) / (pred.rows * pred.cols);
+//         }
+//     }
+// }
+
+// static inline nn_real cef(const Matrix pred, const Matrix true_val) {
+//     // 实际上，pred 和 true_val 都是 1xN 的矩阵, 但为了通用性, 这里允许任意形状的矩阵
+//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
+//     nn_real sum = 0.0f;
+//     for (size_t i = 0; i < pred.rows; i++) {
+//         for (size_t j = 0; j < pred.cols; j++) {
+//             nn_real p = mat_at(pred, i, j);
+//             nn_real t = mat_at(true_val, i, j);
+//             sum += t * logf(p + NN_EPSILON);  // 加一个小的常数避免 log(0)
+//         }
+//     }
+//     return -sum / (pred.rows * pred.cols);
+// }
+
+// static inline nn_real cef_grad(const Matrix pred, const Matrix true_val, Matrix grad) {
+//     NN_ASSERT(pred.rows == true_val.rows && pred.cols == true_val.cols);
+//     NN_ASSERT(grad.rows == pred.rows && grad.cols == pred.cols);
+//     for (size_t i = 0; i < pred.rows; i++) {
+//         for (size_t j = 0; j < pred.cols; j++) {
+//             nn_real p = mat_at(pred, i, j);
+//             nn_real t = mat_at(true_val, i, j);
+//             mat_at(grad, i, j) = -t / (p + NN_EPSILON) / (pred.rows * pred.cols);  // 加一个小的常数避免除以 0
+//         }
+//     }
+// }
+
+// #define LOSS \
+//     X(LOSS_MSE, msef,   msef_grad) \
+//     X(LOSS_CE,  cef,    cef_grad)
+
+// #define X(id, fn, grad_fn) id,
+// typedef enum { LOSS } LossType;
+// #undef X
+
+// static inline nn_real activate(LossType type, nn_real x) {
+//     switch (type) {
+//         #define X(id, fn, grad_fn) case id: return fn(x);
+//         LOSS
+//         #undef X
+//     }
+//     return x;
+// }
+
 
 // ==================== Implementation ====================
 
