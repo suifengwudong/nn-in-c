@@ -19,7 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "nn.h"
+#include "../nn.h"
 
 #define MNIST_IMAGE_SIZE   28
 #define MNIST_IMAGE_PIXELS (MNIST_IMAGE_SIZE * MNIST_IMAGE_SIZE)  // 784

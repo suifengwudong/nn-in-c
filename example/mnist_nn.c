@@ -1,18 +1,19 @@
 // MNIST 数据集神经网络训练示例, 采用小批量随机梯度下降 (SGD)
 //
-// 用法: minst_nn [epochs] [batch_size] [learning_rate]
-// 默认: minst_nn 5 128 0.1
+// 用法: mnist_nn [epochs] [batch_size] [learning_rate]
+// 默认: mnist_nn 5 128 0.1
 // 输出: 每 epoch 的 loss 与训练准确率写入 build/mnist_loss.csv
 
 #define NN_IMPLEMENTATION
 #define MNIST_IMPLEMENTATION
-#include "nn.h"
-#include "mnist.h"
+#include "../nn.h"
+#include "./mnist.h"
 
 #include <stdlib.h>
 #include <time.h>
 
 #define LEN(xs) (sizeof(xs) / sizeof((xs)[0]))
+#define __FILENAME__ "mnist_nn"
 
 // 取矩阵某一行的最大值所在列下标 (argmax)
 static size_t argmax_row(const Matrix m, size_t row) {
@@ -28,7 +29,7 @@ static size_t argmax_row(const Matrix m, size_t row) {
 // 在整个数据集上计算分类准确率
 static double accuracy(NN nn, const MNIST_Data* data) {
     size_t correct = 0;
-    Matrix out = nn.layers[nn.num_layers - 1].activations;
+    Matrix out = nn.layers[nn.num_fclayers - 1].activations;
     for (size_t n = 0; n < data->count; n++) {
         mat_copy(nn.input, mat_row(data->images, n));
         nn_forward(nn);
@@ -39,25 +40,30 @@ static double accuracy(NN nn, const MNIST_Data* data) {
 }
 
 int main(int argc, char** argv) {
-    srand(time(0));
+    srand(42);
 
     int epochs = argc > 1 ? atoi(argv[1]) : 5;
     int batch_size = argc > 2 ? atoi(argv[2]) : 128;
     nn_real lr = argc > 3 ? (nn_real)atof(argv[3]) : 0.1f;
 
     MNIST_Data train = mnist_load(
-        "data/train-images-idx3-ubyte",
-        "data/train-labels-idx1-ubyte");
+        "data/mnist/train-images-idx3-ubyte",
+        "data/mnist/train-labels-idx1-ubyte");
     MNIST_Data test = mnist_load(
-        "data/t10k-images-idx3-ubyte",
-        "data/t10k-labels-idx1-ubyte");
+        "data/mnist/t10k-images-idx3-ubyte",
+        "data/mnist/t10k-labels-idx1-ubyte");
 
     printf("训练集: %zu 张, 测试集: %zu 张\n", train.count, test.count);
 
     // 网络结构: 784 -> 128 -> 64 -> 10, 输出层 identity (logits), 损失用交叉熵
     size_t arch[] = {MNIST_IMAGE_PIXELS, 128, 64, MNIST_NUM_CLASSES};
     ActivationType acts[] = {ACT_GELU, ACT_GELU, ACT_IDENTITY};
-    NN nn = nn_alloc(LEN(arch) - 1, arch, acts, LOSS_CROSS_ENTROPY);
+#ifdef NN_BATCH
+    // 批量版: nn_batch_alloc 一次分配批量缓冲 (batch_size 为最大批次行数)
+    NN nn = nn_batch_alloc(LEN(arch), arch, acts, LOSS_CROSS_ENTROPY, batch_size);
+#else
+    NN nn = nn_alloc(LEN(arch), arch, acts, LOSS_CROSS_ENTROPY);
+#endif
     nn_rand(nn, -0.1f, 0.1f);
 
     // 洗牌索引 + 小批量缓冲区
@@ -68,7 +74,9 @@ int main(int argc, char** argv) {
     Matrix batch_in = mat_alloc(batch_size, MNIST_IMAGE_PIXELS);
     Matrix batch_out = mat_alloc(batch_size, MNIST_NUM_CLASSES);
 
-    FILE* log = fopen("build/mnist_loss.csv", "w");
+    char file_name[256];
+    snprintf(file_name, sizeof(file_name), "build/%s_%d_%d_%f_loss.csv", __FILENAME__, epochs, batch_size, lr);
+    FILE* log = fopen(file_name, "w");
     NN_ASSERT(log != NULL);
     fprintf(log, "Epoch,Loss,TrainAcc\n");
 
@@ -92,8 +100,13 @@ int main(int argc, char** argv) {
                 mat_copy(mat_row(in, i), mat_row(train.images, perm[start + i]));
                 mat_copy(mat_row(out, i), mat_row(train.labels, perm[start + i]));
             }
+#ifdef NN_BATCH
+            // 批量版: 内部 self-forward + 反向 + 更新, 一步到位
+            nn_train_batch(&nn, in, out, lr);
+#else
             nn_backprop(nn, in, out);
             nn_learn(nn, lr);
+#endif
         }
 
         nn_real loss = nn_cost(nn, train.images, train.labels);
@@ -104,7 +117,7 @@ int main(int argc, char** argv) {
     }
 
     double test_acc = accuracy(nn, &test);
-    printf("\n测试集准确率: %.4f 总时间 %ld\n", test_acc, (long)(time(NULL) - t0));
+    printf("\n测试集准确率: %.4f 总时间 %lds\n", test_acc, (long)(time(NULL) - t0));
 
     fclose(log);
     free(perm);

@@ -1,11 +1,11 @@
 #define NN_IMPLEMENTATION
-#include "nn.h"
+#include "../nn.h"
 
 #include <time.h>
 #define LEN(xs) (sizeof(xs) / sizeof((xs)[0]))
 
 int main() {
-    srand(time(0));
+    srand(42);
 
     nn_real data[] = {
         0, 0, 0,
@@ -19,7 +19,7 @@ int main() {
 
     size_t arch[] = {2, 2, 1};
     ActivationType acts[] = {ACT_SIGMOID, ACT_SIGMOID};
-    NN nn = nn_alloc(LEN(arch) - 1, arch, acts, LOSS_MSE);
+    NN nn = nn_alloc(LEN(arch), arch, acts, LOSS_MSE);
     nn_rand(nn, 0, 1.0);
 
     printf("Cost: %f\n", nn_cost(nn, train_in, train_out));
@@ -38,7 +38,7 @@ int main() {
         nn_forward(nn);
         printf("(%f, %f) -> %f (expected %f)\n",
             mat_at(train_in, n, 0), mat_at(train_in, n, 1),
-            mat_at(nn.layers[nn.num_layers - 1].activations, 0, 0), mat_at(train_out, n, 0));
+            mat_at(nn.layers[nn.num_fclayers - 1].activations, 0, 0), mat_at(train_out, n, 0));
     }
 
     mat_free(train_data);
