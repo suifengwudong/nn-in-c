@@ -1,7 +1,7 @@
 // MNIST 数据集神经网络训练示例, 采用小批量随机梯度下降 (SGD)
 //
-// 用法: minst_nn [epochs] [batch_size] [learning_rate]
-// 默认: minst_nn 5 128 0.1
+// 用法: mnist_nn [epochs] [batch_size] [learning_rate]
+// 默认: mnist_nn 5 128 0.1
 // 输出: 每 epoch 的 loss 与训练准确率写入 build/mnist_loss.csv
 
 #define NN_IMPLEMENTATION
